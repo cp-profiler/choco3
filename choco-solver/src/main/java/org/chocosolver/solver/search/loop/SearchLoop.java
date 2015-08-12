@@ -46,6 +46,11 @@ import org.chocosolver.util.tools.ArrayUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Stack;
+
+import cpprofiler.Connector;
+import message.Message.Node;
+
 import static org.chocosolver.solver.objective.ObjectiveManager.SAT;
 import static org.chocosolver.solver.propagation.NoPropagationEngine.SINGLETON;
 import static org.chocosolver.solver.search.loop.Reporting.fullReport;
@@ -118,6 +123,17 @@ public class SearchLoop implements ISearchLoop {
 
     // Store the number of wrolds to jump to -- usefull in UpBranch
     int jumpTo;
+
+    // Stacks of 'Parent Id' and 'Alternative' used when backtrack
+    Stack pid_stack = new Stack();
+    Stack alt_stack = new Stack();
+
+    /*  Node count: different from measures.getNodeCount()
+        as we count failure nodes as well */
+    int nc = 0;
+
+    // Used to communicate every node
+    Connector connector = new Connector();
 
     /**
      * Stores the search measures
@@ -256,16 +272,23 @@ public class SearchLoop implements ISearchLoop {
      */
     private void loop() {
         alive = true;
+        connector.connectToSocket(6565); // 6565 is the port used by cpprofiler by default
+        connector.restartGist(-1); // restart id is -1, which signifies no restarts
         while (alive) {
             switch (nextState) {
                 // INITIALIZE THE SEARCH LOOP
                 case INIT:
+
+                    alt_stack.push(-1); // -1 is alt for the root node
+                    pid_stack.push(-1); // -1 is pid for the root node
+
                     smList.beforeInitialize();
                     initialize();
                     smList.afterInitialize();
                     break;
                 // INITIAL PROPAGATION -- ROOT NODE FEASABILITY
                 case INITIAL_PROPAGATION:
+
                     smList.beforeInitialPropagation();
                     initialPropagation();
                     smList.afterInitialPropagation();
@@ -278,18 +301,31 @@ public class SearchLoop implements ISearchLoop {
                     break;
                 // GOING DOWN IN THE TREE SEARCH TO APPLY THE NEXT COMPUTED DECISION
                 case DOWN_LEFT_BRANCH:
+
+                    pid_stack.push(nc); // two child nodes will
+                    pid_stack.push(nc); // have the same pid
+                    nc++;
+                    alt_stack.push(0);
+
                     smList.beforeDownLeftBranch();
                     downLeftBranch();
                     smList.afterDownLeftBranch();
                     break;
                 // GOING DOWN IN THE TREE SEARCH TO APPLY THE NEXT COMPUTED DECISION
                 case DOWN_RIGHT_BRANCH:
+
+                    nc++;
+                    alt_stack.push(1);
+
                     smList.beforeDownRightBranch();
                     downRightBranch();
                     smList.afterDownRightBranch();
                     break;
                 // GOING UP IN THE TREE SEARCH TO RECONSIDER THE CURRENT DECISION
                 case UP_BRANCH:
+
+                    pid_stack.pop();
+
                     smList.beforeUpBranch();
                     upBranch();
                     smList.afterUpBranch();
@@ -304,6 +340,7 @@ public class SearchLoop implements ISearchLoop {
         }
         smList.beforeClose();
         close();
+        connector.disconnectFromSocket();
         smList.afterClose();
     }
 
@@ -367,9 +404,20 @@ public class SearchLoop implements ISearchLoop {
         if (decision != null) { // null means there is no more decision
             decision.setPrevious(tmp);
             moveTo(DOWN_LEFT_BRANCH);
+            /// use tmp instead of decision as I want to delay labels (child nodes carry decisions made in parents)
+            connector.sendNode(nc, (int) pid_stack.lastElement(), (int) alt_stack.pop(), 2, Node.NodeStatus.BRANCH, tmp.toString(), "");
         } else {
             decision = tmp;
             recordSolution();
+
+            /// build a solution string to send to the profiler
+            Variable[] vars = solver.getStrategy().getVariables();
+            StringBuilder solution = new StringBuilder(32);
+            for (Variable v : vars) {
+                solution.append(v).append(' ');
+            }
+            connector.sendNode(nc, (int) pid_stack.lastElement(), (int) alt_stack.pop(), 0, Node.NodeStatus.SOLVED, decision.toString(),
+                    solution.toString());
         }
     }
 
@@ -408,6 +456,7 @@ public class SearchLoop implements ISearchLoop {
             moveTo(OPEN_NODE);
         } catch (ContradictionException e) {
             solver.getEngine().flush();
+            connector.sendNode(nc, (int) pid_stack.lastElement(), (int) alt_stack.pop(), 0, Node.NodeStatus.FAILED, decision.toString(), e.toString());
             moveTo(UP_BRANCH);
             jumpTo = 1;
             smList.onContradiction(e);
